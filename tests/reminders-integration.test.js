@@ -52,15 +52,17 @@ function MakeWorkspaceInfo(ArgSuffix) {
 /**
  * Build reminder runtime file paths for a workspace.
  * @param {string} ArgWorkspaceName Workspace name.
- * @returns {{ remindersFilePath: string, counterFilePath: string, enabledChannelsFilePath: string, completedFilePath: string }}
+ * @returns {{ remindersFilePath: string, counterFilePath: string, enabledChannelsFilePath: string, completedFilePath: string, eventsFilePath: string }}
  */
 function GetReminderRuntimePaths(ArgWorkspaceName) {
   const RemindersDirPath = path.join(__dirname, '..', 'data', 'runtime', 'reminders');
+  const EventsDirPath = path.join(__dirname, '..', 'data', 'runtime', 'events');
   return {
     remindersFilePath: path.join(RemindersDirPath, `${ArgWorkspaceName}_reminders.json`),
     counterFilePath: path.join(RemindersDirPath, `${ArgWorkspaceName}_reminder_counter.json`),
     enabledChannelsFilePath: path.join(RemindersDirPath, `${ArgWorkspaceName}_enabled_channels.json`),
     completedFilePath: path.join(RemindersDirPath, `${ArgWorkspaceName}_completed.json`),
+    eventsFilePath: path.join(EventsDirPath, `${ArgWorkspaceName}_events.jsonl`),
   };
 }
 
@@ -78,6 +80,49 @@ async function CleanupReminderRuntimeFilesAsync(ArgWorkspaceName) {
 }
 
 describe('RemindersModule integration via MockSlackApp', () => {
+  test('REMINDERS_READ_SOURCE loads a lossless baseline projection and rolls back to JSON', async () => {
+    const WorkspaceInfo = MakeWorkspaceInfo('projection_read_source');
+    const RuntimePaths = GetReminderRuntimePaths(WorkspaceInfo.WORKSPACE_NAME);
+    const Reminder = {
+      ReminderID: 'projection-reminder-1', CreatedOn: '2026-08-01T12:00:00.000Z',
+      ShouldPostOn: '2026-08-02T12:00:00.000Z', TargetChannelID: 'C_REMINDERS',
+      OriginalChannelID: 'C_SOURCE', OriginalMessageID: '100.200', OriginalThreadTs: '100.000',
+      OriginalSenderID: 'U_SENDER', OriginalChannelName: 'engineering', ReminderMessageText: 'Ship projection read',
+      IgnoreSnooze: false, AssigneeID: 'U_OWNER', AssigneeIDs: ['U_OWNER'], GitHubUrls: [],
+      clientId: null, projectId: null, State: 'scheduled',
+    };
+    const BaselineEvent = {
+      v: 1, id: 'baseline-projection-reminder-1', ts: Reminder.CreatedOn, workspace: WorkspaceInfo.WORKSPACE_NAME,
+      type: 'BaselineReminderImported', reminderId: Reminder.ReminderID,
+      payload: {
+        text: Reminder.ReminderMessageText, assigneeId: Reminder.AssigneeID, assigneeIds: Reminder.AssigneeIDs,
+        sourceChannelId: Reminder.OriginalChannelID, targetChannelId: Reminder.TargetChannelID,
+        dueAt: Reminder.ShouldPostOn, state: Reminder.State, githubUrls: Reminder.GitHubUrls,
+        createdOn: Reminder.CreatedOn, originalSenderId: Reminder.OriginalSenderID,
+        originalMessageId: Reminder.OriginalMessageID, originalThreadTs: Reminder.OriginalThreadTs,
+        originalChannelName: Reminder.OriginalChannelName, ignoreSnooze: Reminder.IgnoreSnooze,
+        clientId: Reminder.clientId, projectId: Reminder.projectId,
+      },
+    };
+    await fs.mkdir(path.dirname(RuntimePaths.remindersFilePath), { recursive: true });
+    await fs.mkdir(path.dirname(RuntimePaths.eventsFilePath), { recursive: true });
+    await fs.writeFile(RuntimePaths.remindersFilePath, JSON.stringify([Reminder]), 'utf8');
+    await fs.writeFile(RuntimePaths.eventsFilePath, `${JSON.stringify(BaselineEvent)}\n`, 'utf8');
+
+    process.env.REMINDERS_READ_SOURCE = 'projection';
+    const ProjectionModule = new RemindersModule(new MockSlackApp({ WorkspaceInfo }));
+    await ProjectionModule.StartAsync(EmptyWorkspaceStats);
+    expect(ProjectionModule.GetAllReminders()).toMatchObject([{ ReminderID: Reminder.ReminderID, ReminderMessageText: Reminder.ReminderMessageText, State: 'scheduled' }]);
+    await ProjectionModule.StopAsync();
+
+    delete process.env.REMINDERS_READ_SOURCE;
+    const RollbackModule = new RemindersModule(new MockSlackApp({ WorkspaceInfo }));
+    await RollbackModule.StartAsync(EmptyWorkspaceStats);
+    expect(RollbackModule.GetAllReminders()).toMatchObject([{ ReminderID: Reminder.ReminderID, ReminderMessageText: Reminder.ReminderMessageText, State: 'scheduled' }]);
+    await RollbackModule.StopAsync();
+    await CleanupReminderRuntimeFilesAsync(WorkspaceInfo.WORKSPACE_NAME);
+  });
+
   describe('show reminders', () => {
     test('show reminders posts empty-state message when queue is empty', async () => {
       const SlackApp = new MockSlackApp({ WorkspaceInfo: TestWorkspaceInfo });

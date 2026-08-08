@@ -20,6 +20,10 @@ function BaselineEvent(ArgOverrides = {}) {
       text: 'Ship the derived snapshot', assigneeId: 'U_OWNER', assigneeIds: ['U_OWNER'],
       sourceChannelId: 'C_SOURCE', targetChannelId: 'C_TARGET', dueAt: '2026-08-02T12:00:00.000Z',
       state: 'scheduled', githubUrls: ['https://github.com/acme/repo/pull/1'],
+      // Required for strict parity once a reminder carries GitHub URLs (QA 2026-08-08):
+      // github-comment-relay.js:102 refuses to relay when GitHubRelayStopped is set, so a fold that
+      // cannot restore these would resume a relay a user stopped. Models a post-schema-expansion event.
+      gitHubRelayStarted: false, gitHubRelayStopped: false,
       createdOn: '2026-08-01T12:00:00.000Z', originalSenderId: 'U_SENDER',
       originalMessageId: '123.456', originalThreadTs: '123.000', originalChannelName: 'engineering',
       ignoreSnooze: false, clientId: 'acme', projectId: 'ledger',
@@ -48,7 +52,12 @@ test('a derived snapshot is loadable by the legacy JSON loaders without conversi
       {
         id: 'evt-done', ts: '2026-08-03T12:00:00.000Z', workspace: 'snapshot-test',
         type: 'ReminderCompleted', reminderId: 'rem-1',
-        payload: { by: 'U_OWNER', method: 'reaction', summary: 'Ship the derived snapshot', completedAt: '2026-08-03T12:00:00.000Z' },
+        // v2: strict mode now requires the authoritative completedMs, since a re-parsed ISO
+        // instant is a different number from the one the CompletionRecord stored.
+        payload: {
+          by: 'U_OWNER', method: 'reaction', summary: 'Ship the derived snapshot',
+          completedAt: '2026-08-03T12:00:00.000Z', completedMs: Date.parse('2026-08-03T12:00:00.000Z'),
+        },
       },
     ], { strict: true });
 
@@ -79,7 +88,10 @@ test('event-count compaction retains a bounded, fold-equivalent replay baseline'
     const Events = [BaselineEvent(), {
       id: 'evt-done', ts: '2026-08-03T12:00:00.000Z', workspace: 'snapshot-test',
       type: 'ReminderCompleted', reminderId: 'rem-1',
-      payload: { by: 'U_OWNER', method: 'reaction', summary: 'Ship the derived snapshot', completedAt: '2026-08-03T12:00:00.000Z' },
+      payload: {
+        by: 'U_OWNER', method: 'reaction', summary: 'Ship the derived snapshot',
+        completedAt: '2026-08-03T12:00:00.000Z', completedMs: Date.parse('2026-08-03T12:00:00.000Z'),
+      },
     }];
     const Folded = FoldReminderReadModels(Events, { strict: true });
     const Result = await WriteSnapshotAndCompactAsync({
@@ -107,4 +119,22 @@ test('compacted baseline construction is deterministic and contains no historica
   assert.deepEqual(First, Second);
   assert.equal(First.length, 1);
   assert.equal(First[0].type, 'BaselineReminderImported');
+});
+
+test('compaction preserves relay state for an OPEN relay-capable reminder', () => {
+  // Compaction REPLACES the log. A field dropped here is gone for good — there is no earlier event
+  // left to recover it from — so a compacted baseline that lost GitHubRelayStopped would resume a
+  // relay the user deliberately stopped, permanently. The open path had no coverage for this.
+  const Folded = FoldReminderReadModels([
+    BaselineEvent({ payload: {
+      ...BaselineEvent().payload, gitHubRelayStopped: true, gitHubRelayStarted: true,
+    } }),
+  ], { strict: true });
+  assert.equal(Folded.reminders.length, 1);
+
+  const Compacted = BuildCompactedEvents({ workspace: 'snapshot-test', folded: Folded });
+  const ReFolded = FoldReminderReadModels(Compacted, { strict: true });
+  assert.deepEqual(ReFolded, Folded, 'a compacted log must fold to the same state it was built from');
+  assert.equal(ReFolded.reminders[0].GitHubRelayStopped, true);
+  assert.equal(ReFolded.reminders[0].GitHubRelayStarted, true);
 });

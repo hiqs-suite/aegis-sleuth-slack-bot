@@ -3,7 +3,7 @@
 
 const fs = require('node:fs').promises;
 const path = require('node:path');
-const { createEventStore } = require('../src/event-store');
+const { createEventStore, CURRENT_SCHEMA_VERSION, REQUIRED_PAYLOAD_KEYS_V2 } = require('../src/event-store');
 
 const ACTIVE_SUFFIX = '_reminders.json';
 const COMPLETED_SUFFIX = '_completed.json';
@@ -149,7 +149,13 @@ function BuildBaselineEvent(ArgReminder, ArgStoreKind) {
     || GetNonEmptyString(ArgReminder?.state)
     || (ArgStoreKind === 'completed' ? 'completed' : 'scheduled');
 
+  const AssigneeIds = GetStringArray(ArgReminder?.AssigneeIDs ?? ArgReminder?.assigneeIds);
+  const AssigneeId = GetNonEmptyString(ArgReminder?.AssigneeID)
+    || GetNonEmptyString(ArgReminder?.assigneeID)
+    || GetNonEmptyString(ArgReminder?.assigneeId);
+
   const Event = {
+    v: CURRENT_SCHEMA_VERSION,
     type: 'BaselineReminderImported',
     reminderId: ReminderId,
     payload: {
@@ -157,9 +163,11 @@ function BuildBaselineEvent(ArgReminder, ArgStoreKind) {
         || GetNonEmptyString(ArgReminder?.summary)
         || GetNonEmptyString(ArgReminder?.text)
         || '',
-      assigneeId: GetNonEmptyString(ArgReminder?.AssigneeID)
-        || GetNonEmptyString(ArgReminder?.assigneeID)
-        || GetNonEmptyString(ArgReminder?.assigneeId),
+      assigneeId: AssigneeId,
+      // AssigneeIDs is the authoritative record and assigneeId only its deprecated first-entry
+      // mirror, so a record written before shared assignments existed still has to produce a
+      // non-lying array — otherwise the import silently undoes GH-22 for every legacy reminder.
+      assigneeIds: AssigneeIds.length > 0 ? AssigneeIds : (AssigneeId ? [AssigneeId] : []),
       sourceChannelId: SourceChannelId,
       targetChannelId: TargetChannelId,
       dueAt: DueAt,
@@ -174,6 +182,15 @@ function BuildBaselineEvent(ArgReminder, ArgStoreKind) {
       originalChannelName: GetNonEmptyString(ArgReminder?.OriginalChannelName)
         || GetNonEmptyString(ArgReminder?.originalChannelName),
       ignoreSnooze: Boolean(ArgReminder?.IgnoreSnooze ?? ArgReminder?.ignoreSnooze),
+      clientId: GetNonEmptyString(ArgReminder?.clientId) || GetNonEmptyString(ArgReminder?.ClientID),
+      // Unlike a native creation, an import CAN legitimately carry `true` here: the JSON record it
+      // reads may describe a thread whose relay started, or was stopped, long before the ledger
+      // existed. Omitting them would let a flag-on read resume a relay a user deliberately stopped.
+      gitHubRelayStarted: Boolean(ArgReminder?.GitHubRelayStarted ?? ArgReminder?.gitHubRelayStarted),
+      gitHubRelayStopped: Boolean(ArgReminder?.GitHubRelayStopped ?? ArgReminder?.gitHubRelayStopped),
+      // `createdOn` cannot be substituted from `ts`: ts is when the append ran, not when the
+      // reminder was created, and the projection compares raw bytes against the JSON store.
+      createdOn: ResolveCreatedOnIsoString(ArgReminder),
     },
   };
 
@@ -183,6 +200,45 @@ function BuildBaselineEvent(ArgReminder, ArgStoreKind) {
   }
 
   return Event;
+}
+
+/**
+ * Does the stream already carry everything a v2 fold needs for this reminder?
+ *
+ * Judged against the MERGED creation payloads, matching how the projection judges parity: a v1
+ * event followed by an enrich event is a repaired stream, not a broken one, so re-enriching it
+ * would append a line that changes nothing.
+ * @param {object[]} ArgEvents Every event already in the workspace stream.
+ * @returns {Map<string, boolean>} reminderId → true when no enrichment is needed.
+ */
+function BuildReminderCompletenessMap(ArgEvents) {
+  /** @type {Map<string, Set<string>>} */
+  const KeysById = new Map();
+  for(const Event of ArgEvents) {
+    if(!Event || typeof Event !== 'object') continue;
+    if(Event.type !== 'ReminderCreated' && Event.type !== 'BaselineReminderImported') continue;
+    const ReminderId = GetNonEmptyString(Event.reminderId);
+    if(ReminderId === null) continue;
+    const Payload = Event.payload && typeof Event.payload === 'object' ? Event.payload : {};
+    let Keys = KeysById.get(ReminderId);
+    if(!Keys) {
+      Keys = new Set();
+      KeysById.set(ReminderId, Keys);
+    }
+    for(const Key of Object.keys(Payload)) {
+      if(Payload[Key] !== undefined) Keys.add(Key);
+    }
+  }
+
+  // A baseline import can only ever be judged against the baseline requirement set — it is what this
+  // script writes, and it is a superset of what a native creation needs for reconstruction.
+  const Required = REQUIRED_PAYLOAD_KEYS_V2.BaselineReminderImported;
+  /** @type {Map<string, boolean>} */
+  const Complete = new Map();
+  for(const [ReminderId, Keys] of KeysById) {
+    Complete.set(ReminderId, Required.every(ArgKey => Keys.has(ArgKey)));
+  }
+  return Complete;
 }
 
 /**
@@ -203,8 +259,11 @@ function BuildSeededReminderIdSet(ArgEvents) {
 }
 
 /**
- * @param {{ workspace: string, remindersDir: string, eventsDir: string }} ArgOptions
- * @returns {Promise<{ workspace: string, baselineEvents: object[], skippedReminderIds: string[] }>}
+ * @param {{ workspace: string, remindersDir: string, eventsDir: string, enrich?: boolean }} ArgOptions
+ *   `enrich` re-emits a v2 event for a reminder that IS already seeded but whose existing events
+ *   predate the schema expansion. Without it this script can only ever seed reminders the ledger has
+ *   never heard of — which means it could not repair the streams that actually need repairing.
+ * @returns {Promise<{ workspace: string, baselineEvents: object[], skippedReminderIds: string[], enrichedReminderIds: string[] }>}
  */
 async function CollectMissingBaselineEventsAsync(ArgOptions) {
   const Workspace = ArgOptions.workspace;
@@ -218,11 +277,15 @@ async function CollectMissingBaselineEventsAsync(ArgOptions) {
   const EventStore = createEventStore({ rootDir: ArgOptions.eventsDir });
   const ExistingEvents = await EventStore.readAll(Workspace);
   const SeededReminderIds = BuildSeededReminderIdSet(ExistingEvents);
+  const CompleteById = BuildReminderCompletenessMap(ExistingEvents);
+  const Enrich = ArgOptions.enrich === true;
 
   /** @type {object[]} */
   const BaselineEvents = [];
   /** @type {string[]} */
   const SkippedReminderIds = [];
+  /** @type {string[]} */
+  const EnrichedReminderIds = [];
 
   for(const [StoreKind, Reminders] of [['active', ActiveReminders], ['completed', CompletedReminders]]) {
     for(const Reminder of Reminders) {
@@ -230,7 +293,10 @@ async function CollectMissingBaselineEventsAsync(ArgOptions) {
       if(ReminderId === null) {
         continue;
       }
-      if(SeededReminderIds.has(ReminderId)) {
+      const AlreadySeeded = SeededReminderIds.has(ReminderId);
+      // Already complete, or enrichment not asked for: nothing to write. Re-emitting a complete
+      // record would append a line that changes no fold, which is pure ledger noise.
+      if(AlreadySeeded && (!Enrich || CompleteById.get(ReminderId) === true)) {
         SkippedReminderIds.push(ReminderId);
         continue;
       }
@@ -239,7 +305,9 @@ async function CollectMissingBaselineEventsAsync(ArgOptions) {
         continue;
       }
       BaselineEvents.push(Event);
+      if(AlreadySeeded) EnrichedReminderIds.push(ReminderId);
       SeededReminderIds.add(ReminderId);
+      CompleteById.set(ReminderId, true);
     }
   }
 
@@ -247,12 +315,13 @@ async function CollectMissingBaselineEventsAsync(ArgOptions) {
     workspace: Workspace,
     baselineEvents: BaselineEvents,
     skippedReminderIds: SkippedReminderIds,
+    enrichedReminderIds: EnrichedReminderIds,
   };
 }
 
 /**
- * @param {{ workspace: string, remindersDir: string, eventsDir: string, write?: boolean }} ArgOptions
- * @returns {Promise<{ workspace: string, baselineEvents: object[], skippedReminderIds: string[], appendedCount: number }>}
+ * @param {{ workspace: string, remindersDir: string, eventsDir: string, write?: boolean, enrich?: boolean }} ArgOptions
+ * @returns {Promise<{ workspace: string, baselineEvents: object[], skippedReminderIds: string[], enrichedReminderIds: string[], appendedCount: number }>}
  */
 async function ImportWorkspaceAsync(ArgOptions) {
   const Result = await CollectMissingBaselineEventsAsync(ArgOptions);
@@ -277,20 +346,26 @@ async function ImportWorkspaceAsync(ArgOptions) {
 
 /**
  * @param {string[]} ArgArgv
- * @returns {{ repoRoot: string, workspaces: string[]|null, write: boolean, json: boolean }}
+ * @returns {{ repoRoot: string, workspaces: string[]|null, write: boolean, json: boolean, enrich: boolean }}
  */
 function ParseArgs(ArgArgv) {
+  /** @type {{ repoRoot: string, workspaces: string[]|null, write: boolean, json: boolean, enrich: boolean }} */
   const Options = {
     repoRoot: path.resolve(__dirname, '..'),
     workspaces: null,
     write: false,
     json: false,
+    enrich: false,
   };
 
   for(let Index = 0; Index < ArgArgv.length; Index += 1) {
     const Arg = ArgArgv[Index];
     if(Arg === '--write') {
       Options.write = true;
+      continue;
+    }
+    if(Arg === '--enrich') {
+      Options.enrich = true;
       continue;
     }
     if(Arg === '--json') {
@@ -344,6 +419,7 @@ async function MainAsync(ArgArgv = process.argv.slice(2)) {
       remindersDir: RemindersDir,
       eventsDir: EventsDir,
       write: Options.write,
+      enrich: Options.enrich,
     }));
   }
 
@@ -352,8 +428,13 @@ async function MainAsync(ArgArgv = process.argv.slice(2)) {
   } else {
     for(const Result of Results) {
       const Mode = Options.write ? 'write' : 'dry-run';
+      // Report the enrichment split explicitly. A run that says "12 events" while 12 of them are
+      // re-emissions of reminders the ledger already knew reads as new coverage when it is repair.
+      const Enriched = Result.enrichedReminderIds.length > 0
+        ? ` — ${Result.enrichedReminderIds.length} enriching an existing reminder`
+        : '';
       console.log(
-        `${Result.workspace}: ${Result.baselineEvents.length} baseline event(s) ${Options.write ? 'appended' : 'planned'} (${Mode})`
+        `${Result.workspace}: ${Result.baselineEvents.length} baseline event(s) ${Options.write ? 'appended' : 'planned'} (${Mode})${Enriched}`
       );
     }
   }
@@ -370,6 +451,7 @@ if (require.main === module) {
 
 module.exports = {
   BuildBaselineEvent,
+  BuildReminderCompletenessMap,
   CollectMissingBaselineEventsAsync,
   EnumerateWorkspaceNamesAsync,
   ImportWorkspaceAsync,

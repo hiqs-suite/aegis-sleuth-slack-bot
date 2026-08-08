@@ -42,7 +42,94 @@ const REQUIRED_PAYLOAD_KEYS = {
   ReminderSnoozed: ['until', 'by'],
   ReminderCancelled: ['by', 'reason'],
   BaselineReminderImported: ['text', 'assigneeId', 'sourceChannelId', 'targetChannelId', 'dueAt', 'state'],
+  // v2 additions (schema expansion). Present in the v1 map with an EMPTY v1 requirement so a v1
+  // reader still recognises the type — `readAll` only checks that the type is known — while the v2
+  // requirements below are what an append is actually held to.
+  ReminderStateChanged: [],
+  ThreadRelayStateChanged: [],
 };
+
+/**
+ * SCHEMA v2 — the wider requirement set, enforced on APPEND ONLY.
+ *
+ * Design comes from a cross-model consult (Codex + agy, 2026-08-08) where the two disagreed. Codex
+ * wanted a closed `(version,type)` registry whose unknown/invalid versions become a READ error;
+ * agy argued that `readAll()` does not validate payloads today (it checks only that the type is
+ * known), so making reads throw is new brittleness on the path we least want to destabilise.
+ *
+ * agy's design won on mechanism: v1 events keep reading exactly as before, and only newly written
+ * events are held to v2. Codex's guarantee is preserved elsewhere — the parity check records the
+ * event version, so a v1-only stream can never claim v2 parity and therefore can never serve a
+ * projection.
+ *
+ * @type {Record<string, string[]>}
+ */
+const REQUIRED_PAYLOAD_KEYS_V2 = {
+  ReminderCreated: [
+    ...REQUIRED_PAYLOAD_KEYS.ReminderCreated,
+    // Reconstruction fields. Event.ts is stamped when the APPEND runs, not when the reminder was
+    // created, so `createdOn` cannot be substituted from it without changing raw JSON bytes.
+    'createdOn', 'originalSenderId', 'originalMessageId', 'originalThreadTs',
+    'originalChannelName', 'ignoreSnooze',
+    // assigneeIds is the AUTHORITATIVE assignee record; assigneeId is only its deprecated
+    // first-entry mirror (src/reminders-module.js:84-85). Requiring the scalar alone would let the
+    // ledger quietly undo GH-22's multi-assignee support. Caught by agy in consult.
+    'assigneeIds',
+    'clientId',
+    // Relay state's STARTING value. ThreadRelayStateChanged carries every later change, but a fold
+    // still needs the initial one — and `undefined` is not it: github-comment-relay.js:102 refuses
+    // to relay when GitHubRelayStopped is set, so a stream that omits the field would RESUME a relay
+    // a user deliberately stopped. Always false for a native creation (a reminder that has never
+    // existed cannot have relayed), but written explicitly so the fold reads a fact, not a default.
+    'gitHubRelayStarted', 'gitHubRelayStopped',
+  ],
+  ReminderScheduled: [
+    ...REQUIRED_PAYLOAD_KEYS.ReminderScheduled,
+    // The live queue resets IgnoreSnooze to false before scheduling
+    // (src/reminders-module.js:3455-3458). Without carrying it, a fold keeps the stale value and
+    // the rebalance export publishes it to an external consumer.
+    'ignoreSnooze',
+  ],
+  ReminderCompleted: [
+    ...REQUIRED_PAYLOAD_KEYS.ReminderCompleted,
+    'sourceChannelId', 'dueDate', 'clientId',
+    // The authoritative CompletionRecord stamps completedMs with Date.now(); the event previously
+    // re-sampled an ISO instant, so the two could never be byte-identical. v2 carries the
+    // authoritative value verbatim.
+    'completedMs',
+  ],
+  ReminderSnoozed: REQUIRED_PAYLOAD_KEYS.ReminderSnoozed,
+  ReminderCancelled: REQUIRED_PAYLOAD_KEYS.ReminderCancelled,
+  BaselineReminderImported: [
+    ...REQUIRED_PAYLOAD_KEYS.BaselineReminderImported,
+    'createdOn', 'originalSenderId', 'originalMessageId', 'originalThreadTs',
+    'originalChannelName', 'ignoreSnooze', 'assigneeIds', 'clientId',
+    // Unlike a native creation, an IMPORT can legitimately carry `true` here — the JSON record it
+    // reads may describe a thread whose relay already started or was stopped months ago. This is
+    // exactly what the enrich mode exists to backfill.
+    'gitHubRelayStarted', 'gitHubRelayStopped',
+  ],
+  // Generic transition event. #EmitTransitionEvent previously mapped only four states and skipped
+  // due/overdue/posting/posted/rescheduled/failed/dead-letter, so a fold silently retained
+  // `scheduled` for a reminder that had actually gone overdue. Production persists at least
+  // `overdue`, so this was not theoretical.
+  ReminderStateChanged: ['fromState', 'toState', 'reason'],
+  // Relay state is THREAD-scoped, not reminder-scoped: one Slack thread can affect several
+  // reminders. Codex proposed fanning out to one event per reminder at emission; agy argued that
+  // invents a cardinality the domain lacks and breaks when a new reminder joins an existing thread.
+  // agy's design won: emit once with the thread identity, let the fold apply it to every reminder
+  // sharing that thread. Thread identity is GH-27's `OriginalThreadTs ?? OriginalMessageID`.
+  //
+  // `reminderId` is structurally required by every event, so this one carries the synthetic
+  // `thread:<threadKey>` rather than an arbitrary member reminder. Picking a member would be a lie
+  // about scope AND a dangling reference once that reminder completes, while the synthetic key keeps
+  // the envelope invariant intact and stays self-describing on disk. The fold dispatches on `type`
+  // before any id lookup, so it never manufactures a reminder from one.
+  ThreadRelayStateChanged: ['threadKey', 'relayStarted', 'relayStopped'],
+};
+
+/** Events written from now on. v1 remains readable forever. */
+const CURRENT_SCHEMA_VERSION = 2;
 
 /**
  * Validate an event against the closed enum + required payload keys. Returns the
@@ -65,15 +152,26 @@ function NormalizeEvent(ArgEvent) {
   if(!Payload || typeof Payload !== 'object' || Array.isArray(Payload)) {
     return null;
   }
-  for(const Key of REQUIRED_PAYLOAD_KEYS[ArgEvent.type]) {
-    if(!Object.prototype.hasOwnProperty.call(Payload, Key)) {
+  // Which requirement set applies. An event carrying no explicit `v` is treated as v1, so historical
+  // events and any caller that has not been updated keep working unchanged.
+  const Version = typeof ArgEvent.v === 'number' ? ArgEvent.v : 1;
+  const RequiredKeys = Version >= 2
+    ? (REQUIRED_PAYLOAD_KEYS_V2[ArgEvent.type] || REQUIRED_PAYLOAD_KEYS[ArgEvent.type])
+    : REQUIRED_PAYLOAD_KEYS[ArgEvent.type];
+
+  for(const Key of RequiredKeys) {
+    // `hasOwnProperty` is NOT presence: it returns true for a key whose value is `undefined`, and
+    // JSON.stringify then DROPS that key, so an event could pass validation and be written with the
+    // field missing from the serialized line. Caught by Codex in consult and verified. Requiring the
+    // value to be defined closes it; `null` stays legal because most of these fields are nullable.
+    if(!Object.prototype.hasOwnProperty.call(Payload, Key) || Payload[Key] === undefined) {
       return null;
     }
   }
   // Shape is valid — auto-assign id/v/ts only if absent so caller-supplied
   // values (e.g. a deterministic id in a test) are preserved.
   return {
-    v: typeof ArgEvent.v === 'number' ? ArgEvent.v : 1,
+    v: Version,
     id: typeof ArgEvent.id === 'string' && ArgEvent.id.length > 0 ? ArgEvent.id : `evt_${crypto.randomUUID()}`,
     ts: typeof ArgEvent.ts === 'string' && ArgEvent.ts.length > 0 ? ArgEvent.ts : new Date().toISOString(),
     workspace: ArgEvent.workspace,
@@ -255,4 +353,4 @@ function createEventStore(ArgOptions) {
   };
 }
 
-module.exports = { createEventStore };
+module.exports = { createEventStore, CURRENT_SCHEMA_VERSION, REQUIRED_PAYLOAD_KEYS, REQUIRED_PAYLOAD_KEYS_V2 };

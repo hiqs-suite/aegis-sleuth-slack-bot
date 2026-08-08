@@ -159,7 +159,7 @@ function ParseEvents(ArgText, ArgPath) {
  * Compare the three Phase 5 read surfaces.  `rebalance` is optional because it
  * must be captured from the current API separately; when absent the report says
  * so rather than inventing a parity result.
- * @param {{ workspace: string, events: any[], reminders: any[], completed: any[], rebalance?: any|null, remindersRaw?: string, completedRaw?: string, rebalanceRaw?: string }} ArgInput
+ * @param {{ workspace: string, events: any[], reminders: any[], completed: any[], rebalance?: any|null, rebalanceProjection?: any|null, remindersRaw?: string, completedRaw?: string, rebalanceRaw?: string, rebalanceProjectionRaw?: string }} ArgInput
  * @returns {object}
  */
 function BuildParityReport(ArgInput) {
@@ -170,12 +170,23 @@ function BuildParityReport(ArgInput) {
     completed: { authoritative: ArgInput.completed, authoritativeRaw: ArgInput.completedRaw, projection: Folded.completed },
   };
   if(ArgInput.rebalance !== null && ArgInput.rebalance !== undefined) {
-    Surfaces.rebalance = { authoritative: ArgInput.rebalance, authoritativeRaw: ArgInput.rebalanceRaw, projection: ProjectedRebalance };
+    // The real export includes Slack-resolved display fields and a capture timestamp.
+    // A flag-on API capture therefore supplies the projection side here; the pure
+    // shape remains the explicit fallback for fixture diagnosis before that capture.
+    Surfaces.rebalance = {
+      authoritative: ArgInput.rebalance,
+      authoritativeRaw: ArgInput.rebalanceRaw,
+      projection: ArgInput.rebalanceProjection ?? ProjectedRebalance,
+      projectionRaw: ArgInput.rebalanceProjectionRaw,
+    };
   }
 
   const Report = { workspace: ArgInput.workspace, byteDiffs: {}, semanticDiffs: {}, missingSurfaces: [] };
   for(const [Name, Values] of Object.entries(Surfaces)) {
-    Report.byteDiffs[Name] = CompareBytes(Values.authoritativeRaw || SerializeCanonical(Values.authoritative), SerializeCanonical(Values.projection));
+    Report.byteDiffs[Name] = CompareBytes(
+      Values.authoritativeRaw || SerializeCanonical(Values.authoritative),
+      Values.projectionRaw || SerializeCanonical(Values.projection)
+    );
     Report.semanticDiffs[Name] = CompareSemantics(Values.authoritative, Values.projection);
   }
   if(!Object.prototype.hasOwnProperty.call(Surfaces, 'rebalance')) Report.missingSurfaces.push('rebalance');
@@ -187,15 +198,15 @@ function BuildParityReport(ArgInput) {
 
 /**
  * @param {string[]} ArgArgv
- * @returns {{ workspace: string, events: string, reminders: string, completed: string, rebalance: string|null }}
+ * @returns {{ workspace: string, events: string, reminders: string, completed: string, rebalance: string|null, rebalanceProjection: string|null }}
  */
 function ParseArgs(ArgArgv) {
-  const Values = { workspace: '', events: '', reminders: '', completed: '', rebalance: null };
+  const Values = { workspace: '', events: '', reminders: '', completed: '', rebalance: null, rebalanceProjection: null };
   for(let Index = 0; Index < ArgArgv.length; Index += 2) {
     const Name = ArgArgv[Index];
     const Value = ArgArgv[Index + 1];
     if(!Value || !Object.prototype.hasOwnProperty.call(Values, Name.slice(2))) {
-      throw new Error('usage: projection-parity-harness --workspace <name> --events <file> --reminders <file> --completed <file> [--rebalance <api-json-file>]');
+      throw new Error('usage: projection-parity-harness --workspace <name> --events <file> --reminders <file> --completed <file> [--rebalance <json-source-api-file> --rebalance-projection <projection-api-file>]');
     }
     Values[Name.slice(2)] = Value;
   }
@@ -212,15 +223,18 @@ function Main() {
   const RemindersRaw = ReadJsonText(path.resolve(Options.reminders));
   const CompletedRaw = ReadJsonText(path.resolve(Options.completed));
   const RebalanceRaw = Options.rebalance ? ReadJsonText(path.resolve(Options.rebalance)) : null;
+  const RebalanceProjectionRaw = Options.rebalanceProjection ? ReadJsonText(path.resolve(Options.rebalanceProjection)) : null;
   const Report = BuildParityReport({
     workspace: Options.workspace,
     events: ParseEvents(EventsRaw, EventsPath),
     reminders: JSON.parse(RemindersRaw),
     completed: JSON.parse(CompletedRaw),
     rebalance: RebalanceRaw ? JSON.parse(RebalanceRaw) : null,
+    rebalanceProjection: RebalanceProjectionRaw ? JSON.parse(RebalanceProjectionRaw) : null,
     remindersRaw: RemindersRaw,
     completedRaw: CompletedRaw,
     rebalanceRaw: RebalanceRaw || undefined,
+    rebalanceProjectionRaw: RebalanceProjectionRaw || undefined,
   });
   process.stdout.write(`${JSON.stringify(Report, null, 2)}\n`);
   process.exitCode = Report.clean ? 0 : 1;

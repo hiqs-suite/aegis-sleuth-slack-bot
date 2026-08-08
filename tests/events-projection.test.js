@@ -189,3 +189,49 @@ test('replay.js --view completed prints valid JSON array (smoke test)', () => {
 
   fs.rmSync(dir, { recursive: true, force: true });
 });
+
+// --- schema v2: the replay/export fold must recognise the two new types ---
+
+test('v2 transition events are recognised, not warned about as unknown', () => {
+  const warnings = [];
+  const events = FixtureEvents().concat([
+    {
+      v: 2, id: 'evt_v2_state', ts: '2026-06-11T10:00:00Z', workspace: 'neochrome',
+      type: 'ReminderStateChanged', reminderId: 'rem_a',
+      payload: { fromState: 'scheduled', toState: 'overdue', reason: 'due-passed' },
+    },
+    {
+      v: 2, id: 'evt_v2_relay', ts: '2026-06-11T10:01:00Z', workspace: 'neochrome',
+      type: 'ThreadRelayStateChanged', reminderId: 'thread:1773990000.000088',
+      payload: { threadKey: '1773990000.000088', relayStarted: true, relayStopped: false },
+    },
+  ]);
+  const records = FoldReminders(events, { warn: (m) => warnings.push(m) });
+  assert.strictEqual(warnings.length, 0, 'a valid v2 stream must produce no forward-compat warnings');
+
+  // The thread-scoped event must NOT mint a row keyed on its synthetic id.
+  assert.strictEqual(records.length, 3);
+  assert.ok(!records.some((r) => r.reminderId.startsWith('thread:')), 'no phantom reminder from a thread event');
+
+  // The generic transition carries states the specific events never emitted.
+  const remA = records.find((r) => r.reminderId === 'rem_a');
+  assert.strictEqual(remA.state, 'overdue');
+  assert.strictEqual(remA.isActive, false);
+});
+
+test('a v2 cancellation keeps this export cancelled spelling', () => {
+  // The FSM says `canceled`; this shape has always published `cancelled`. ReminderStateChanged
+  // carries the FSM spelling verbatim, so without a mapping the same cancellation would fold to a
+  // different string depending on which event landed last.
+  const events = FixtureEvents().concat([
+    {
+      v: 2, id: 'evt_v2_cancel', ts: '2026-06-10T09:05:00Z', workspace: 'neochrome',
+      type: 'ReminderStateChanged', reminderId: 'rem_c',
+      payload: { fromState: 'scheduled', toState: 'canceled', reason: 'obsolete' },
+    },
+  ]);
+  const out = foldToRebalanceShape(events, { workspace: 'neochrome' });
+  const remC = out.reminders.find((r) => r.reminderId === 'rem_c');
+  assert.strictEqual(remC.state, 'cancelled');
+  assert.strictEqual(remC.isActive, false);
+});

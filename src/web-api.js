@@ -11,6 +11,8 @@ const DateUtils = require('./date-utils');
 const RemindersDisplayUtils = require('./reminders-display-utils');
 const SlackFormatUtils = require('./slack-format-utils');
 const { ResolveClientIdentity } = require('./client-mapping');
+const { createEventStore } = require('./event-store');
+const { FoldReminderReadModels, ReadWithProjectionFallbackAsync } = require('./reminders-projection');
 
 // add typedefs for our own types.
 /**
@@ -349,31 +351,48 @@ class WebAPI {
   /**
    * Read a workspace reminders file from disk.
    * @param {string} ArgWorkspaceName Workspace name.
+   * @param {'REMINDERS_READ_SOURCE'|'REBALANCE_EXPORT_SOURCE'} [ArgFlagName] Independent source flag.
    * @returns {Promise<{ Reminders: any[], RemindersFilePath: string }>}
    */
-  async #ReadWorkspaceRemindersAsync(ArgWorkspaceName) {
+  async #ReadWorkspaceRemindersAsync(ArgWorkspaceName, ArgFlagName = 'REMINDERS_READ_SOURCE') {
     const RemindersFilePath = path.join(__dirname, '..', 'data', 'runtime', 'reminders', `${ArgWorkspaceName}_reminders.json`);
-
-    try {
-      const RawJSON = await fs.readFile(RemindersFilePath, 'utf8');
-      const ParsedJSON = JSON.parse(RawJSON);
-      if(!Array.isArray(ParsedJSON))
-        throw new Error('Reminders file is malformed. Expected a JSON array.');
-
-      return {
-        Reminders: ParsedJSON,
-        RemindersFilePath
-      };
-    } catch(error) {
-      if(error.code === 'ENOENT') {
-        return {
-          Reminders: [],
-          RemindersFilePath
-        };
+    const ReadAuthoritativeAsync = async () => {
+      try {
+        const RawJSON = await fs.readFile(RemindersFilePath, 'utf8');
+        const ParsedJSON = JSON.parse(RawJSON);
+        if(!Array.isArray(ParsedJSON))
+          throw new Error('Reminders file is malformed. Expected a JSON array.');
+        return ParsedJSON;
+      } catch(error) {
+        if(error.code === 'ENOENT') return [];
+        throw error;
       }
+    };
+    const Result = await ReadWithProjectionFallbackAsync({
+      flagName: ArgFlagName,
+      Logger: console,
+      ReadAuthoritativeAsync,
+      ReadProjectionAsync: async () => (await this.#ReadWorkspaceProjectionAsync(ArgWorkspaceName)).reminders,
+    });
+    return { Reminders: Result.value, RemindersFilePath };
+  }
 
-      throw error;
-    }
+  /**
+   * Fold a workspace's event ledger for the Phase 5 read flags.  An absent or
+   * incomplete log is an error on purpose: ReadWithProjectionFallbackAsync then
+   * serves the JSON store instead of an unsafe empty projection.
+   * @param {string} ArgWorkspaceName Workspace name.
+   * @returns {Promise<{ reminders: any[], completed: any[] }>}
+   */
+  async #ReadWorkspaceProjectionAsync(ArgWorkspaceName) {
+    const EventsRootPath = path.join(__dirname, '..', 'data', 'runtime', 'events');
+    const SafeWorkspaceName = String(ArgWorkspaceName).replace(/[^A-Za-z0-9._-]/g, '_');
+    const EventsFilePath = path.join(EventsRootPath, `${SafeWorkspaceName}_events.jsonl`);
+    await fs.access(EventsFilePath);
+    const EventStore = createEventStore({ rootDir: EventsRootPath });
+    const Events = await EventStore.readAll(ArgWorkspaceName);
+    if(Events.length === 0) throw new Error('event ledger is empty');
+    return FoldReminderReadModels(Events, { strict: true });
   }
 
   /**
@@ -386,16 +405,22 @@ class WebAPI {
   async #ReadWorkspaceCompletedAsync(ArgWorkspaceName) {
     const CompletedFilePath = path.join(__dirname, '..', 'data', 'runtime', 'reminders', `${ArgWorkspaceName}_completed.json`);
 
-    try {
-      const RawJSON = await fs.readFile(CompletedFilePath, 'utf8');
-      const ParsedJSON = JSON.parse(RawJSON);
-      return Array.isArray(ParsedJSON) ? ParsedJSON : [];
-    } catch(error) {
-      if(error.code === 'ENOENT')
-        return [];
-
-      throw error;
-    }
+    const Result = await ReadWithProjectionFallbackAsync({
+      flagName: 'COMPLETED_READ_SOURCE',
+      Logger: console,
+      ReadAuthoritativeAsync: async () => {
+        try {
+          const RawJSON = await fs.readFile(CompletedFilePath, 'utf8');
+          const ParsedJSON = JSON.parse(RawJSON);
+          return Array.isArray(ParsedJSON) ? ParsedJSON : [];
+        } catch(error) {
+          if(error.code === 'ENOENT') return [];
+          throw error;
+        }
+      },
+      ReadProjectionAsync: async () => (await this.#ReadWorkspaceProjectionAsync(ArgWorkspaceName)).completed,
+    });
+    return Result.value;
   }
 
   /**
@@ -900,7 +925,8 @@ class WebAPI {
       const WorkspaceExists = await workspaces.WorkspaceExistsAsync(WorkspaceName);
       if(!WorkspaceExists) throw new Error('Workspace not found.');
 
-      const { Reminders, RemindersFilePath } = await this.#ReadWorkspaceRemindersAsync(WorkspaceName);
+      const SourceFlag = ResponseFormat === 'rebalance' ? 'REBALANCE_EXPORT_SOURCE' : 'REMINDERS_READ_SOURCE';
+      const { Reminders, RemindersFilePath } = await this.#ReadWorkspaceRemindersAsync(WorkspaceName, SourceFlag);
       const FilteredReminders = this.#FilterReminderRecords(Reminders, ActiveOnly, StateFilter);
       if(ResponseFormat === 'rebalance') {
         let WorkspaceTimeZone = 'UTC';

@@ -40,8 +40,10 @@ describe('GET /workspace/:name/reminders', () => {
   let API;
   let ActualPort;
   const RemindersDir = path.join(__dirname, '..', 'data', 'runtime', 'reminders');
+  const EventsDir = path.join(__dirname, '..', 'data', 'runtime', 'events');
   const TestWorkspaceName = 'WebAPIRemindersTest';
   const RemindersFilePath = path.join(RemindersDir, `${TestWorkspaceName}_reminders.json`);
+  const EventsFilePath = path.join(EventsDir, `${TestWorkspaceName}_events.jsonl`);
   // mutable map held by the WebAPI instance — tests that need a live mock SlackApp set it here.
   const TestSlackApps = new Map();
 
@@ -54,11 +56,57 @@ describe('GET /workspace/:name/reminders', () => {
   afterAll(async () => {
     await API.StopAsync();
     await fs.rm(RemindersFilePath, { force: true });
+    await fs.rm(EventsFilePath, { force: true });
   });
 
   afterEach(() => {
     jest.restoreAllMocks();
     TestSlackApps.clear();
+    delete process.env.REMINDERS_READ_SOURCE;
+    delete process.env.REBALANCE_EXPORT_SOURCE;
+    delete process.env.COMPLETED_READ_SOURCE;
+  });
+
+  test('reminder and rebalance flags independently use a lossless event projection and roll back to JSON', async () => {
+    const ReminderSeed = [{
+      ReminderID: 'api-projection-1', CreatedOn: '2026-08-01T12:00:00.000Z', ShouldPostOn: '2026-08-02T12:00:00.000Z',
+      TargetChannelID: 'C_REMINDERS', OriginalChannelID: 'C_SOURCE', OriginalMessageID: '100.200',
+      OriginalThreadTs: '100.000', OriginalSenderID: 'U_SENDER', OriginalChannelName: 'engineering',
+      ReminderMessageText: 'Use the projection', IgnoreSnooze: false, AssigneeID: 'U_OWNER', AssigneeIDs: ['U_OWNER'],
+      GitHubUrls: [], clientId: null, projectId: null, State: 'scheduled',
+    }];
+    const Event = {
+      v: 1, id: 'baseline-api-projection-1', ts: ReminderSeed[0].CreatedOn, workspace: TestWorkspaceName,
+      type: 'BaselineReminderImported', reminderId: ReminderSeed[0].ReminderID,
+      payload: {
+        text: ReminderSeed[0].ReminderMessageText, assigneeId: 'U_OWNER', assigneeIds: ['U_OWNER'],
+        sourceChannelId: 'C_SOURCE', targetChannelId: 'C_REMINDERS', dueAt: ReminderSeed[0].ShouldPostOn,
+        state: 'scheduled', githubUrls: [], createdOn: ReminderSeed[0].CreatedOn,
+        originalSenderId: 'U_SENDER', originalMessageId: '100.200', originalThreadTs: '100.000',
+        originalChannelName: 'engineering', ignoreSnooze: false, clientId: null, projectId: null,
+      },
+    };
+    jest.spyOn(workspaces, 'WorkspaceExistsAsync').mockResolvedValue(true);
+    await fs.mkdir(RemindersDir, { recursive: true });
+    await fs.mkdir(EventsDir, { recursive: true });
+    await fs.writeFile(RemindersFilePath, JSON.stringify(ReminderSeed), 'utf8');
+    await fs.writeFile(EventsFilePath, `${JSON.stringify(Event)}\n`, 'utf8');
+
+    process.env.REMINDERS_READ_SOURCE = 'projection';
+    const ProjectedRaw = await AuthenticatedGetAsync(ActualPort, `/workspace/${TestWorkspaceName}/reminders`);
+    expect(ProjectedRaw).toEqual({ success: true, data: ReminderSeed });
+    delete process.env.REMINDERS_READ_SOURCE;
+    const RolledBackRaw = await AuthenticatedGetAsync(ActualPort, `/workspace/${TestWorkspaceName}/reminders`);
+    expect(RolledBackRaw).toEqual({ success: true, data: ReminderSeed });
+
+    process.env.REBALANCE_EXPORT_SOURCE = 'projection';
+    const ProjectedRebalance = await AuthenticatedGetAsync(ActualPort, `/workspace/${TestWorkspaceName}/reminders?format=rebalance`);
+    delete process.env.REBALANCE_EXPORT_SOURCE;
+    const RolledBackRebalance = await AuthenticatedGetAsync(ActualPort, `/workspace/${TestWorkspaceName}/reminders?format=rebalance`);
+    expect(ProjectedRebalance.success).toBe(true);
+    expect(RolledBackRebalance.success).toBe(true);
+    expect(ProjectedRebalance.data.reminders).toEqual(RolledBackRebalance.data.reminders);
+    expect(ProjectedRebalance.data.source).toEqual(RolledBackRebalance.data.source);
   });
 
   test('returns reminders array from disk for a valid workspace', async () => {

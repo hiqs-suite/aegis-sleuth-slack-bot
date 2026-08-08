@@ -1,6 +1,7 @@
 'use strict';
 
 const { WriteFileDurableAsync } = require('./durable-write');
+const { CURRENT_SCHEMA_VERSION } = require('./event-store');
 
 /**
  * Event-count bound used when compacting a workspace ledger. The writer still writes a fresh
@@ -10,11 +11,56 @@ const { WriteFileDurableAsync } = require('./durable-write');
 const DEFAULT_COMPACTION_EVENT_COUNT = 100;
 
 /**
+ * The folded state this writer dumps. Declared as real shapes rather than `object[]` so `checkJs`
+ * can see the fields — a bare `object[]` gives elements with NO properties, which is why every
+ * `Reminder.OriginalMessageID` / `Completion.completedMs` access raised TS2339 and `npm run build`
+ * was red. Fields mirror the legacy on-disk shape the pre-P3 loader reads, which is the whole point
+ * of the phase: a snapshot must be legacy-loadable for rollback to stay a flag flip.
+ * @typedef {Object} FoldedReminder
+ * @property {string} ReminderID
+ * @property {string|Date} CreatedOn
+ * @property {string|Date} ShouldPostOn
+ * @property {string} ReminderMessageText
+ * @property {string|null} AssigneeID
+ * @property {string[]} [AssigneeIDs]
+ * @property {string|null} OriginalChannelID
+ * @property {string|null} TargetChannelID
+ * @property {string} State
+ * @property {string[]} [GitHubUrls]
+ * @property {string|null} [OriginalSenderID]
+ * @property {string|null} [OriginalMessageID]
+ * @property {string|null} [OriginalThreadTs]
+ * @property {string|null} [OriginalChannelName]
+ * @property {boolean} [IgnoreSnooze]
+ * @property {string|null} [clientId]
+ * @property {string|null} [projectId]
+ * @property {boolean} [GitHubRelayStarted]
+ * @property {boolean} [GitHubRelayStopped]
+ */
+
+/**
+ * @typedef {Object} FoldedCompletion
+ * @property {string} reminderId
+ * @property {number} completedMs
+ * @property {string|null} [summary]
+ * @property {string|null} [assigneeID]
+ * @property {string|null} [sourceChannelID]
+ * @property {string|null} [dueDate]
+ * @property {string|null} [clientId]
+ */
+
+/**
+ * @typedef {Object} FoldedState
+ * @property {FoldedReminder[]} reminders
+ * @property {FoldedCompletion[]} completed
+ */
+
+/**
  * Write legacy JSON read models from an already-folded event state. This deliberately accepts
  * plain data rather than a live module/store: it is a projection dump, never a read-modify-write
  * of either legacy file.
  *
- * @param {{ reminderFilePath: string, completionFilePath: string, folded: { reminders: object[], completed: object[] }, Logger?: any }} ArgOptions
+ * @param {{ reminderFilePath: string, completionFilePath: string, folded: FoldedState, Logger?: any }} ArgOptions
  * @returns {Promise<void>}
  */
 async function WriteDerivedSnapshotAsync(ArgOptions) {
@@ -35,15 +81,17 @@ async function WriteDerivedSnapshotAsync(ArgOptions) {
  * therefore replays current state, not the unbounded historical transition stream. Completed
  * records retain their completion event so their timestamp and summary survive the fold.
  *
- * @param {{ workspace: string, folded: { reminders: object[], completed: object[] } }} ArgOptions
+ * @param {{ workspace: string, folded: FoldedState }} ArgOptions
  * @returns {object[]}
  */
 function BuildCompactedEvents(ArgOptions) {
   const Folded = ArgOptions.folded || { reminders: [], completed: [] };
   const Workspace = ArgOptions.workspace;
   const Events = [];
-  const AddBaseline = (ArgReminder, ArgSuffix) => {
-    const Reminder = ArgReminder || {};
+  const AddBaseline = (/** @type {FoldedReminder} */ ArgReminder, /** @type {string} */ ArgSuffix) => {
+    // Cast, not a bare `|| {}`: the runtime null-guard is still wanted, but the untyped `{}` branch
+    // widens the union to a property-less object and every field access below becomes TS2339.
+    const Reminder = /** @type {FoldedReminder} */ (ArgReminder || {});
     const ReminderID = typeof Reminder.ReminderID === 'string' ? Reminder.ReminderID : null;
     if(!ReminderID) return;
     const CreatedOn = Reminder.CreatedOn instanceof Date
@@ -53,7 +101,11 @@ function BuildCompactedEvents(ArgOptions) {
       ? Reminder.ShouldPostOn.toISOString()
       : (typeof Reminder.ShouldPostOn === 'string' ? Reminder.ShouldPostOn : null);
     Events.push({
-      v: 1,
+      // Compaction REPLACES the log, so a compacted event that omits a v2 field permanently
+      // destroys the parity the fold has already achieved — there is no earlier event left to
+      // recover it from. The strict gate caught exactly that, on this writer, when it started
+      // requiring completedMs.
+      v: CURRENT_SCHEMA_VERSION,
       id: `snapshot-${ArgSuffix}-${ReminderID}`,
       ts: CreatedOn,
       workspace: Workspace,
@@ -76,6 +128,11 @@ function BuildCompactedEvents(ArgOptions) {
         ignoreSnooze: Boolean(Reminder.IgnoreSnooze),
         clientId: Reminder.clientId || null,
         projectId: Reminder.projectId || null,
+        // github-comment-relay.js:102 refuses to relay when GitHubRelayStopped is set. A compacted
+        // baseline that dropped these would resume a relay the user stopped, with no earlier event
+        // left to contradict it.
+        gitHubRelayStarted: Boolean(Reminder.GitHubRelayStarted),
+        gitHubRelayStopped: Boolean(Reminder.GitHubRelayStopped),
       },
     });
   };
@@ -96,7 +153,7 @@ function BuildCompactedEvents(ArgOptions) {
       State: 'scheduled',
     }, 'completed');
     Events.push({
-      v: 1,
+      v: CURRENT_SCHEMA_VERSION,
       id: `snapshot-completed-${Completion.reminderId}`,
       ts: CompletedAt,
       workspace: Workspace,
@@ -107,6 +164,12 @@ function BuildCompactedEvents(ArgOptions) {
         method: 'snapshot',
         summary: Completion.summary || null,
         completedAt: CompletedAt,
+        // Carried verbatim, not re-derived from CompletedAt: round-tripping through an ISO string
+        // is exactly the lossy step this schema version exists to remove.
+        completedMs: CompletedMs,
+        sourceChannelId: Completion.sourceChannelID || null,
+        dueDate: Completion.dueDate || null,
+        clientId: Completion.clientId || null,
       },
     });
   }
@@ -118,7 +181,7 @@ function BuildCompactedEvents(ArgOptions) {
  * The log rewrite happens only after both snapshots land, so an interrupted compaction leaves a
  * usable old log or a complete new compacted log.
  *
- * @param {{ reminderFilePath: string, completionFilePath: string, eventFilePath: string, workspace: string, events: object[], folded: { reminders: object[], completed: object[] }, compactionEventCount?: number, Logger?: any }} ArgOptions
+ * @param {{ reminderFilePath: string, completionFilePath: string, eventFilePath: string, workspace: string, events: object[], folded: FoldedState, compactionEventCount?: number, Logger?: any }} ArgOptions
  * @returns {Promise<{ compacted: boolean, replayEventCount: number }>}
  */
 async function WriteSnapshotAndCompactAsync(ArgOptions) {

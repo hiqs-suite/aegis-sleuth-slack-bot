@@ -77,6 +77,31 @@ change:
 extend emission coverage to the omitted transitions, add a strict boot-read error signal, backfill
 the new fields, and only then establish parity. That is its own plan, not a retry of p5.
 
+### Phase 5 read cutover — result of the 2026-08-08 re-run
+
+p6 re-ran on the corrected lane via `MARATHON-P6-ONLY.yaml` and is **APPROVED, gate passed**
+(98 suites / 1561 tests, `tsc` exit 0, `validate:fsm` OK). It converted **two of the three** read
+surfaces and correctly **halted on the third**:
+
+| Read surface | Flag | Owner | Result |
+|---|---|---|---|
+| reminder queue | `REMINDERS_READ_SOURCE` | `src/reminders-module.js` | **converted** |
+| `?format=rebalance` export | `REBALANCE_EXPORT_SOURCE` | `src/web-api.js` | **converted** |
+| completed store | `COMPLETED_READ_SOURCE` | `src/web-api.js` | **BLOCKED** (shipped live in round 1, then blocked after QA) |
+
+`src/reminders-module.js` now imports `reminders-projection` — the integration three earlier
+phases never achieved, because the file was not in their lane.
+
+**Why the completed store halted, verified independently.** `GitHubRelayStarted` and
+`GitHubRelayStopped` are persisted `ReminderInfo` fields (`src/reminders-module.js:87-88`) but are
+**not** in the event-store's accepted event enum, so a fold silently drops them and the read would be
+lossy. The builder refused to ship it and the reviewer approved the halt — the reversibility contract
+doing its job, exactly as it did for p5.
+
+**This adds a requirement to the schema proposal.** The event-schema expansion that unblocks Phase 4
+must ALSO carry the GitHub-relay state fields, or `COMPLETED_READ_SOURCE` stays blocked even after
+Phase 4 lands. That is a new finding from this run, not part of the original Phase 4 blocker list.
+
 **Why Phases 5 and 6a delivered modules but no integration.** Their marathon lanes excluded the
 files they were meant to change — `src/reminders-module.js` and `src/web-api.js` were not in p6's
 `artifact:` list, and containment reverts edits outside a lane. The artifact lists are corrected in

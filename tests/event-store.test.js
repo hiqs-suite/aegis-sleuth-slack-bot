@@ -256,3 +256,130 @@ test('appends still work after the root dir is created once', async () => {
   const Events = await Store.readAll('ws');
   assert.deepStrictEqual(Events.map(e => e.id), ['evt_a', 'evt_b']);
 });
+
+// --- schema v2: the wider requirement set applies to WRITES ONLY ---
+
+const { CURRENT_SCHEMA_VERSION, REQUIRED_PAYLOAD_KEYS_V2 } = require('../src/event-store');
+
+/** A ReminderCreated carrying every v2 key. */
+function MakeCreatedV2(ArgOverrides = {}) {
+  const Base = MakeCreated();
+  return {
+    ...Base,
+    v: CURRENT_SCHEMA_VERSION,
+    payload: {
+      ...Base.payload,
+      createdOn: '2026-08-08T09:00:00.000Z',
+      originalSenderId: 'U_SENDER',
+      originalMessageId: '123.456',
+      originalThreadTs: null,
+      originalChannelName: 'engineering',
+      ignoreSnooze: false,
+      assigneeIds: ['U123'],
+      clientId: null,
+      gitHubRelayStarted: false,
+      gitHubRelayStopped: false,
+    },
+    ...ArgOverrides,
+  };
+}
+
+test('a v1 event is still accepted unchanged after v2 lands', async (t) => {
+  // The whole point of gating on the event's own version: historical writers and every event
+  // already on disk keep working. If this ever fails, the migration became breaking.
+  const RootDir = await MakeRootDir();
+  t.after(() => fs.rm(RootDir, { recursive: true, force: true }));
+  const Store = createEventStore({ rootDir: RootDir });
+
+  const Result = await Store.append('acme', MakeCreated());
+  assert.strictEqual(Result.ok, true, 'a v1-shaped event must still be accepted');
+  const Events = await Store.readAll('acme');
+  assert.strictEqual(Events[0].v, 1);
+});
+
+test('a v2 event missing a v2-only key is rejected and writes nothing', async (t) => {
+  const RootDir = await MakeRootDir();
+  t.after(() => fs.rm(RootDir, { recursive: true, force: true }));
+  const Store = createEventStore({ rootDir: RootDir });
+
+  for(const Key of ['assigneeIds', 'createdOn', 'gitHubRelayStopped', 'clientId']) {
+    const Event = MakeCreatedV2();
+    delete Event.payload[Key];
+    const Result = await Store.append('acme', Event);
+    assert.strictEqual(Result.ok, false, `a v2 event missing ${Key} must be rejected`);
+  }
+  assert.deepStrictEqual(await Store.readAll('acme'), [], 'no rejected event reaches disk');
+});
+
+test('a payload key present but explicitly undefined is rejected', async (t) => {
+  // hasOwnProperty alone returns true here, and JSON.stringify then DROPS the key — so the event
+  // would validate and be written with the field missing from the serialized line.
+  const RootDir = await MakeRootDir();
+  t.after(() => fs.rm(RootDir, { recursive: true, force: true }));
+  const Store = createEventStore({ rootDir: RootDir });
+
+  const Event = MakeCreatedV2();
+  Event.payload.assigneeIds = undefined;
+  const Result = await Store.append('acme', Event);
+  assert.strictEqual(Result.ok, false, 'an undefined required value must not pass validation');
+  assert.deepStrictEqual(await Store.readAll('acme'), []);
+});
+
+test('a required value of null is still legal', async (t) => {
+  const RootDir = await MakeRootDir();
+  t.after(() => fs.rm(RootDir, { recursive: true, force: true }));
+  const Store = createEventStore({ rootDir: RootDir });
+
+  const Event = MakeCreatedV2();
+  Event.payload.clientId = null;
+  Event.payload.originalThreadTs = null;
+  assert.strictEqual((await Store.append('acme', Event)).ok, true, 'most of these fields are nullable');
+});
+
+test('ThreadRelayStateChanged round-trips with its synthetic thread envelope', async (t) => {
+  const RootDir = await MakeRootDir();
+  t.after(() => fs.rm(RootDir, { recursive: true, force: true }));
+  const Store = createEventStore({ rootDir: RootDir });
+
+  const Result = await Store.append('acme', {
+    v: CURRENT_SCHEMA_VERSION,
+    type: 'ThreadRelayStateChanged',
+    reminderId: 'thread:1773990000.000088',
+    payload: { threadKey: '1773990000.000088', relayStarted: true, relayStopped: false },
+  });
+  assert.strictEqual(Result.ok, true);
+
+  const Events = await Store.readAll('acme');
+  assert.strictEqual(Events.length, 1);
+  assert.strictEqual(Events[0].payload.threadKey, '1773990000.000088');
+  assert.strictEqual(Events[0].reminderId, 'thread:1773990000.000088');
+});
+
+test('a v2 event of a NEW type missing a required key is rejected', async (t) => {
+  const RootDir = await MakeRootDir();
+  t.after(() => fs.rm(RootDir, { recursive: true, force: true }));
+  const Store = createEventStore({ rootDir: RootDir });
+
+  const Missing = await Store.append('acme', {
+    v: CURRENT_SCHEMA_VERSION,
+    type: 'ReminderStateChanged',
+    reminderId: 'rem_1',
+    payload: { fromState: 'scheduled', toState: 'overdue' }, // no `reason`
+  });
+  assert.strictEqual(Missing.ok, false);
+  assert.deepStrictEqual(await Store.readAll('acme'), []);
+});
+
+test('a v1-versioned event of a v2-only type is accepted — v1 requires nothing of it', async (t) => {
+  // The two new types are registered in the v1 map with an EMPTY requirement so a v1 READER
+  // recognises them. That deliberately means a v1-stamped one is not held to the v2 payload.
+  const RootDir = await MakeRootDir();
+  t.after(() => fs.rm(RootDir, { recursive: true, force: true }));
+  const Store = createEventStore({ rootDir: RootDir });
+
+  const Result = await Store.append('acme', {
+    v: 1, type: 'ReminderStateChanged', reminderId: 'rem_1', payload: {},
+  });
+  assert.strictEqual(Result.ok, true);
+  assert.ok(REQUIRED_PAYLOAD_KEYS_V2.ReminderStateChanged.length > 0, 'while v2 does require a payload');
+});

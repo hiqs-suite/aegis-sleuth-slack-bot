@@ -44,6 +44,39 @@
 # would schedule p5, p7 and p8, every one of which is deferred. Documenting "run p6 only" was not
 # enough; without this file there was no executable that matched the documented tranche.
 #
+# ── OUTCOME OF THE 2026-08-08 RUN ────────────────────────────────────────────────────────────
+# p6 ran and is APPROVED, gate passed. It converted TWO of the three read surfaces and correctly
+# HALTED on the third:
+#
+#   CONVERTED  reminder queue read      REMINDERS_READ_SOURCE   (src/reminders-module.js)
+#   CONVERTED  ?format=rebalance export REBALANCE_EXPORT_SOURCE (src/web-api.js)
+#   BLOCKED    completed-store read     COMPLETED_READ_SOURCE   — see below (CORRECTED after QA)
+#
+# CORRECTION (QA, 2026-08-08): this file previously said the completed-store surface was "HALTED,
+# not shipped". That was WRONG and I propagated it. The HALT happened in the RETRY round, but round 1
+# had already shipped the flag and wired it live at src/web-api.js:409. Codex QA caught it. The flag
+# is now in BLOCKED_PROJECTION_FLAGS (src/reminders-projection.js) so it can never select the
+# projection, with a loud warning if an operator sets it and a test asserting the projection is not
+# even read. Reality now matches the documentation.
+#
+# The completed-store cutover cannot be lossless: `GitHubRelayStarted` and `GitHubRelayStopped`
+# are persisted ReminderInfo fields (src/reminders-module.js:87-88) but are NOT in the event-store's
+# accepted event enum, so a fold silently drops them. The builder refused to ship a lossy cutover and
+# the reviewer approved the halt — the reversibility contract working exactly as intended, and the
+# same discipline that stopped p5.
+#
+# CONSEQUENCE FOR THE SCHEMA PROPOSAL: the event-schema expansion that unblocks Phase 4 must ALSO
+# carry the GitHub-relay state fields, or COMPLETED_READ_SOURCE stays blocked after Phase 4 lands.
+# This is a NEW requirement discovered by this run, not part of the original Phase 4 blocker list.
+#
+# NOTE on tests/p3-reversibility-drill.test.js: it stays in jest.testPathIgnorePatterns (so Jest
+# never globs a node:test file) but is deliberately NOT in the test:node list. Its stop gate asserts
+# the p6 read flags AND p7's REMINDER_STATE_SOURCE/snapshot wiring together, so registering it before
+# those land makes every phase's gate fail on work that phase cannot do — that is what deadlocked p6
+# and p7 earlier. The p8 lane owns both the drill and package.json and re-registers it as its own
+# deliverable. (This note lived in package.json until npm/jest warned "Unknown option" on it —
+# package.json has no comment syntax; it belongs here.)
+#
 # ── WHAT IS DEFERRED, AND WHY IT IS NOT MERELY "LATER" ───────────────────────────────────────
 #   p5  Phase 4, boot-time rebuild — HALTED. The event schema cannot reconstruct boot state:
 #       ReminderCreated omits OriginalChannelName/OriginalMessageID/OriginalThreadTs/
@@ -92,6 +125,12 @@ phases:
     name: "Phase 5 — convert the remaining reads to projections, with a parity harness"
     reviewer: agy
     brief: PROJECT/2-WORKING/P3-EVENT-SOURCED-CORE/briefs/p6-remaining-projections.md
-    artifact: src/reminders-projection.js,scripts/projection-parity-harness.js,tests/projection-parity.test.js,src/reminders-module.js,src/web-api.js,package.json,tests/reminders-integration.test.js,tests/web-api-reminders.test.js,tests/completion-store.test.js
+    # package-lock.json added 2026-08-08 after the first fire died on a containment violation: agy
+    # ran an npm command, npm noticed package.json (1.4.263) and the lock (1.4.261) disagreed and
+    # synced them, and containment reverted that correct repair and failed the turn. If package.json
+    # is in a lane its lockfile must be too — npm keeps them together, so a lane that admits one and
+    # forbids the other fails on npm's own housekeeping rather than on anything the phase did. The
+    # underlying version drift was pre-existing on development and is fixed in this branch.
+    artifact: src/reminders-projection.js,scripts/projection-parity-harness.js,tests/projection-parity.test.js,src/reminders-module.js,src/web-api.js,package.json,package-lock.json,tests/reminders-integration.test.js,tests/web-api-reminders.test.js,tests/completion-store.test.js
     turn_timeout_s: 1200
     max_review_rounds: 3

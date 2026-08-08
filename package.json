@@ -10,6 +10,7 @@
     "start": "node src/app.js",
     "test": "jest --forceExit && npm run --silent test:node",
     "test:node": "node --test tests/event-store.test.js tests/events-projection.test.js tests/summarize-week-projection.test.js tests/projection-parity.test.js tests/derived-snapshot-writer.test.js",
+    "projection:parity": "node scripts/projection-parity-harness.js",
     "test:watch": "jest --watch",
     "dev": "nodemon src/app.js",
     "build": "tsc --project tsconfig.json",
@@ -53,7 +54,6 @@
       "<rootDir>/tests/derived-snapshot-writer.test.js",
       "<rootDir>/tests/p3-reversibility-drill.test.js"
     ],
-    "_comment_p3_reversibility_drill": "tests/p3-reversibility-drill.test.js stays in testPathIgnorePatterns (so Jest never globs a node:test file) but is deliberately NOT in the test:node list yet. Its stop gate asserts the p6 read flags AND p7's REMINDER_STATE_SOURCE/snapshot wiring together; registering it before those phases land makes every phase's `npm test` pre-advance gate fail on work that phase cannot do, which deadlocked p6 and p7. The p8 lane owns both this file and package.json and re-adds it to test:node as its own deliverable. Do not re-register it earlier.",
     "collectCoverageFrom": [
       "src/**/*.js"
     ]

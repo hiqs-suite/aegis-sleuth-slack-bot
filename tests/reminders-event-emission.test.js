@@ -5,6 +5,9 @@
 // changing transition behavior. Drives a real completion through the public FSM entry point and
 // asserts (a) the transition still succeeds and (b) a ReminderCompleted event lands in the ledger.
 
+// Assert the CURRENT schema version rather than a literal: the ledger moved to v2 in the schema
+// expansion, and pinning a number here means the next bump fails a test instead of being noticed.
+const { CURRENT_SCHEMA_VERSION } = require('../src/event-store');
 const fs = require('fs').promises;
 const path = require('path');
 
@@ -64,9 +67,22 @@ async function ReadLedgerUntilAsync(ArgWorkspace, ArgPredicate, ArgTimeoutMs = 2
   return Lines;
 }
 
-/** Poll until the ledger has at least one line for ArgReminderID. */
-function ReadLedgerForAsync(ArgWorkspace, ArgReminderID, ArgTimeoutMs = 2000) {
-  return ReadLedgerUntilAsync(ArgWorkspace, ArgLines => ArgLines.some(ArgEvent => ArgEvent.reminderId === ArgReminderID), ArgTimeoutMs);
+/**
+ * Poll until the ledger has the SPECIFIC event the caller is about to assert on.
+ *
+ * This replaces a helper that waited only for the FIRST line bearing this reminder id. That stopped
+ * being a sufficient wait once v2 added a generic ReminderStateChanged to every transition: a
+ * transition now writes two events, so the weaker predicate could return on the first while the one
+ * under test was still in flight. It surfaced as a real full-suite failure while the same test
+ * passed in isolation in 0.6s — the signature of a wait that is too weak, not of an emission that is
+ * missing.
+ */
+function ReadLedgerForTypeAsync(ArgWorkspace, ArgReminderID, ArgType, ArgTimeoutMs = 2000) {
+  return ReadLedgerUntilAsync(
+    ArgWorkspace,
+    ArgLines => ArgLines.some(ArgEvent => ArgEvent.reminderId === ArgReminderID && ArgEvent.type === ArgType),
+    ArgTimeoutMs
+  );
 }
 
 describe('P3 Phase 1 — non-authoritative event emission from the FSM', () => {
@@ -111,11 +127,11 @@ describe('P3 Phase 1 — non-authoritative event emission from the FSM', () => {
       expect(Recorded.some(ArgRow => ArgRow.reminderId === ReminderID)).toBe(true);
 
       // (b) The non-authoritative ledger captured a ReminderCompleted event for this reminder.
-      const Ledger = await ReadLedgerForAsync(Workspace, ReminderID);
+      const Ledger = await ReadLedgerForTypeAsync(Workspace, ReminderID, 'ReminderCompleted');
       const Completion = Ledger.find(ArgEvent => ArgEvent.type === 'ReminderCompleted' && ArgEvent.reminderId === ReminderID);
       expect(Completion).toBeDefined();
       expect(Completion.workspace).toBe(Workspace);
-      expect(Completion.v).toBe(1);
+      expect(Completion.v).toBe(CURRENT_SCHEMA_VERSION);
       expect(typeof Completion.id).toBe('string');
       expect(typeof Completion.ts).toBe('string');
       expect(Completion.payload.by).toBe('U_REQUESTER');
@@ -259,11 +275,11 @@ describe('P3 Phase 1 — non-authoritative event emission from the FSM', () => {
       // which are frozen under fake timers. The fire-and-forget append itself is real fs I/O.
       jest.useRealTimers();
 
-      const Ledger = await ReadLedgerForAsync(Workspace, ReminderID);
+      const Ledger = await ReadLedgerForTypeAsync(Workspace, ReminderID, 'ReminderSnoozed');
       const Snoozed = Ledger.find(ArgEvent => ArgEvent.type === 'ReminderSnoozed' && ArgEvent.reminderId === ReminderID);
       expect(Snoozed).toBeDefined();
       expect(Snoozed.workspace).toBe(Workspace);
-      expect(Snoozed.v).toBe(1);
+      expect(Snoozed.v).toBe(CURRENT_SCHEMA_VERSION);
       expect(typeof Snoozed.id).toBe('string');
       expect(typeof Snoozed.ts).toBe('string');
       expect(Snoozed.payload.by).toBe('U_ASSIGNEE');

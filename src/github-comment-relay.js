@@ -54,17 +54,44 @@ class GitHubCommentRelay {
   #SaveRemindersAsync;
 
   /**
+   * Optional ledger hook: append one thread-scoped relay-state event. OPTIONAL on purpose — the
+   * ledger is non-authoritative, so a relay constructed without it (every unit test, and any caller
+   * predating the schema expansion) behaves exactly as before.
+   * @type {((ArgThreadKey: string, ArgState: { relayStarted: boolean, relayStopped: boolean }) => void)|null}
+   */
+  #EmitRelayStateChanged = null;
+
+  /**
    * Initialize a new GitHub comment relay.
    * @param {SlackApp} ArgSlackApp Slack app instance.
    * @param {() => ReminderInfo[]} ArgGetPendingReminders Getter for pending reminders.
    * @param {() => Promise<void>} ArgSaveRemindersAsync Callback to persist reminders to disk.
+   * @param {((ArgThreadKey: string, ArgState: { relayStarted: boolean, relayStopped: boolean }) => void)|null} [ArgEmitRelayStateChanged]
+   *   Best-effort ledger hook, called only AFTER the authoritative save succeeds.
    */
-  constructor(ArgSlackApp, ArgGetPendingReminders, ArgSaveRemindersAsync) {
+  constructor(ArgSlackApp, ArgGetPendingReminders, ArgSaveRemindersAsync, ArgEmitRelayStateChanged = null) {
     if(typeof ArgSaveRemindersAsync !== 'function')
       throw new Error('[github-comment-relay] ArgSaveRemindersAsync callback is required');
     this.#SlackApp = ArgSlackApp;
     this.#GetPendingReminders = ArgGetPendingReminders;
     this.#SaveRemindersAsync = ArgSaveRemindersAsync;
+    this.#EmitRelayStateChanged = typeof ArgEmitRelayStateChanged === 'function' ? ArgEmitRelayStateChanged : null;
+  }
+
+  /**
+   * Append one thread-scoped relay-state event, if a ledger hook was supplied. Never throws: the
+   * ledger is a side log and must never break a relay that has already been persisted.
+   * @param {string} ArgThreadKey Thread identity — `OriginalThreadTs ?? OriginalMessageID` (GH-27).
+   * @param {boolean} ArgRelayStarted
+   * @param {boolean} ArgRelayStopped
+   */
+  #EmitThreadRelayState(ArgThreadKey, ArgRelayStarted, ArgRelayStopped) {
+    if(!this.#EmitRelayStateChanged || !ArgThreadKey) return;
+    try {
+      this.#EmitRelayStateChanged(ArgThreadKey, { relayStarted: ArgRelayStarted, relayStopped: ArgRelayStopped });
+    } catch(error) {
+      this.#SlackApp.Logger.warn('[github-comment-relay] relay-state event emit failed (non-fatal):', error);
+    }
   }
 
   /**
@@ -124,6 +151,14 @@ class GitHubCommentRelay {
           this.#SlackApp.Logger.info(
             `[github-comment-relay] relay stopped for thread ${ArgEventInfo.thread_ts} in channel ${ArgEventInfo.channel}`
           );
+          // Emit the thread's resulting state, not a delta, so the fold is a plain assignment.
+          // Only after the authoritative save succeeded — the ledger must never claim a stop the
+          // JSON store does not have.
+          this.#EmitThreadRelayState(
+            ArgEventInfo.thread_ts,
+            MatchingReminders.some(ArgR => Boolean(ArgR.GitHubRelayStarted)),
+            true
+          );
         }
         return false;
       }
@@ -166,16 +201,28 @@ class GitHubCommentRelay {
         // add a reaction to the Slack message to confirm relay.
         await ArgSlackApp.AddReactionAsync(ArgEventInfo.channel, ArgEventInfo.ts, 'octocat');
 
-        // mark all matching reminders as relay-started after the first successful post.
-        if(IsFirstRelay) {
-          for(const StartedReminder of MatchingReminders)
+        // Mark every reminder sharing this thread as relay-started — keyed on which ones are not
+        // already marked, rather than on IsFirstRelay. A reminder created after the relay began
+        // still belongs to a thread that is relaying, but the old IsFirstRelay-only write recorded
+        // it as never-relayed forever. That also made the JSON store and the thread-scoped ledger
+        // event disagree about the same thread, so parity could never hold. The save stays
+        // conditional, so a steady-state relay still costs no extra write.
+        const NewlyStarted = MatchingReminders.filter(ArgR => !ArgR.GitHubRelayStarted);
+        if(NewlyStarted.length > 0) {
+          for(const StartedReminder of NewlyStarted)
             StartedReminder.GitHubRelayStarted = true;
 
+          let StartSaveSucceeded = false;
           try {
             await this.#SaveRemindersAsync();
+            StartSaveSucceeded = true;
           } catch(error) {
             this.#SlackApp.Logger.error('[github-comment-relay] failed to save relay-started state:', error);
           }
+
+          // relayStopped is definitively false here: the guard above returns early when any
+          // reminder in this thread is stopped, so a started event can never race a stopped one.
+          if(StartSaveSucceeded) this.#EmitThreadRelayState(ArgEventInfo.thread_ts, true, false);
         }
       }
 

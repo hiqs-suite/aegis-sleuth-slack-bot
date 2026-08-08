@@ -61,9 +61,14 @@ test('P8 stop gate: every declared source switch is wired to its live owning rea
 
   // Phase 6: these flags only count if their public readers consume them. The generic helper is
   // deliberately insufficient; an unwired flag is neither a cutover nor a rollback mechanism.
-  for(const FlagName of ['REMINDERS_READ_SOURCE', 'COMPLETED_READ_SOURCE']) {
-    assert.ok(RemindersModuleSource.includes(FlagName), `${FlagName} must be consumed by RemindersModule`);
-  }
+  //
+  // OWNERSHIP CORRECTED 2026-08-08 (QA round 4 nit): COMPLETED_READ_SOURCE was asserted against
+  // RemindersModule, but its only production call site is the dashboard completed-store reader at
+  // src/web-api.js:405-423. Asserting the wrong owner would have made this gate pass on a file that
+  // never consumes the flag, or fail on one that was never supposed to — either way it would not be
+  // checking the thing it claims to check.
+  assert.ok(RemindersModuleSource.includes('REMINDERS_READ_SOURCE'), 'REMINDERS_READ_SOURCE must be consumed by RemindersModule');
+  assert.ok(WebApiSource.includes('COMPLETED_READ_SOURCE'), 'COMPLETED_READ_SOURCE must be consumed by the WebAPI completed-store reader');
   assert.ok(WebApiSource.includes('REBALANCE_EXPORT_SOURCE'), 'REBALANCE_EXPORT_SOURCE must be consumed by the export owner');
 });
 
@@ -128,23 +133,30 @@ test('a stale snapshot identifies exactly the newer completion and cancellation 
   assert.deepEqual(ResurrectedIds, ['rem-complete', 'rem-cancel']);
 });
 
-test('the three independent Phase 6 read flags do not cross workspace boundaries', async () => {
+// REWRITTEN 2026-08-08 after QA. This asserted `On.value === 'projection'` for all three flags —
+// i.e. that enabling one SERVES the projection. That is now the opposite of the contract: all three
+// are in BLOCKED_PROJECTION_FLAGS because their folds are known-lossy (short ledger on a torn
+// append; stale IgnoreSnooze after reschedule; completedMs sampled at a different instant).
+//
+// This file is currently unregistered — it is in jest.testPathIgnorePatterns and absent from
+// test:node — so the stale assertion was not failing anything. It was still a landmine: p8 owns this
+// drill and re-registers it as its own deliverable, at which point the old assertion would have
+// failed the gate for the wrong reason, or worse, been "fixed" by weakening the block.
+test('the three Phase 6 read flags are all blocked and never reach the projection reader', async () => {
   const ReadAuthoritativeAsync = async () => 'json';
-  const ReadProjectionAsync = async () => 'projection';
   for(const FlagName of ['REMINDERS_READ_SOURCE', 'COMPLETED_READ_SOURCE', 'REBALANCE_EXPORT_SOURCE']) {
-    const On = await ReadWithProjectionFallbackAsync({
-      flagName: FlagName,
-      environment: { [FlagName]: 'projection' },
-      ReadAuthoritativeAsync,
-      ReadProjectionAsync,
-    });
-    const Off = await ReadWithProjectionFallbackAsync({
-      flagName: FlagName,
-      environment: {},
-      ReadAuthoritativeAsync,
-      ReadProjectionAsync,
-    });
-    assert.equal(On.value, 'projection');
-    assert.equal(Off.value, 'json');
+    for(const Environment of [{ [FlagName]: 'projection' }, {}]) {
+      let ProjectionRead = false;
+      const Result = await ReadWithProjectionFallbackAsync({
+        flagName: FlagName,
+        environment: Environment,
+        Logger: { warn: () => {} },
+        ReadAuthoritativeAsync,
+        ReadProjectionAsync: async () => { ProjectionRead = true; return 'projection'; },
+      });
+      assert.equal(Result.value, 'json', `${FlagName} must serve the authoritative store`);
+      assert.equal(Result.source, 'authoritative');
+      assert.equal(ProjectionRead, false, `${FlagName} must not even read the projection while blocked`);
+    }
   }
 });

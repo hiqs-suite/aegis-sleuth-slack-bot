@@ -26,7 +26,37 @@ const KNOWN_EVENT_TYPES = new Set([
   'ReminderSnoozed',
   'ReminderCancelled',
   'BaselineReminderImported',
+  // Schema v2. Recognised here so replay.js does not warn on every transition in a v2 stream and,
+  // more importantly, so ThreadRelayStateChanged never reaches the record-creating path below — its
+  // envelope carries the synthetic `thread:<key>` id, which would otherwise fold into a phantom
+  // reminder in the export.
+  'ReminderStateChanged',
+  'ThreadRelayStateChanged',
 ]);
+
+/**
+ * Event types that are known but contribute NOTHING to the rebalance shape, so they must be dropped
+ * before a per-reminder record is created for them.
+ *
+ * ThreadRelayStateChanged is thread-scoped: it has no reminder id of its own, and this export does
+ * not surface relay state at all. Adding it here (rather than to KNOWN_EVENT_TYPES alone) is what
+ * keeps `thread:<key>` from becoming a reminder row.
+ */
+const NON_REMINDER_EVENT_TYPES = new Set([
+  'ThreadRelayStateChanged',
+]);
+
+/**
+ * Map the FSM's state vocabulary (RemindersModule.ReminderState) onto this export's.
+ *
+ * They agree on everything except cancellation: the FSM says `canceled`, this shape has always
+ * emitted `cancelled`. Before v2 that never surfaced, because the state came from a
+ * ReminderCancelled case that hardcoded the double-l spelling. ReminderStateChanged carries the FSM
+ * spelling verbatim, so without this the same cancellation would fold to a different string
+ * depending on which event landed last — a silent vocabulary change in a published export.
+ * @type {Record<string, string>}
+ */
+const STATE_VOCABULARY = { canceled: 'cancelled' };
 
 /**
  * Reminder lifecycle states used by the rebalance shape. Mirrors the state
@@ -161,6 +191,19 @@ function ApplyEvent(ArgRecord, ArgEvent) {
       ArgRecord.state = typeof Payload.state === 'string' ? Payload.state : ArgRecord.state;
       break;
 
+    case 'ReminderStateChanged': {
+      // v2 generic transition — the only event covering due/overdue/posting/posted/rescheduled/
+      // failed/dead-letter, which the specific cases above never emitted. Ignore a non-string or
+      // empty toState rather than clobbering a good state with garbage.
+      const ToState = typeof Payload.toState === 'string' && Payload.toState.length > 0 ? Payload.toState : null;
+      if (ToState !== null) {
+        ArgRecord.state = Object.prototype.hasOwnProperty.call(STATE_VOCABULARY, ToState)
+          ? STATE_VOCABULARY[ToState]
+          : ToState;
+      }
+      break;
+    }
+
     default:
       // unreachable — unknown types are filtered before ApplyEvent
       break;
@@ -196,6 +239,12 @@ function FoldReminders(ArgEvents, ArgOpts = {}) {
     }
     if (!KNOWN_EVENT_TYPES.has(Event.type)) {
       Warn(`[events-projection] skipping unknown event type: ${String(Event.type)}`);
+      continue;
+    }
+    // Known, but not reminder-scoped: dropped silently and BEFORE the record-creation below, so it
+    // cannot mint a row keyed on a synthetic id. Silent because this is expected traffic in a v2
+    // stream, not a forward-compatibility surprise.
+    if (NON_REMINDER_EVENT_TYPES.has(Event.type)) {
       continue;
     }
     const ReminderId = Event.reminderId;
